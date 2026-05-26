@@ -23,6 +23,8 @@ const WS_OPEN = 1;
 
 let _pool = [];
 let _refilling = null;
+let _lastRefillFail = 0;
+const REFILL_RETRY_INTERVAL_MS = 60_000;
 
 if (!isValidUUID(DEFAULT_UUID)) throw new Error('Invalid default UUID');
 
@@ -100,8 +102,19 @@ async function fetchIPDB() {
     for (const r of results) {
         if (r.status === 'fulfilled') all.push(...r.value);
     }
-    if (all.length === 0) throw new Error('all sources failed');
+    if (all.length === 0) return await resolveDoH();
     return [...new Set(all)];
+}
+
+async function resolveDoH() {
+    const resp = await fetch('https://cloudflare-dns.com/dns-query?name=proxyip.cmliussss.net&type=A', {
+        headers: { accept: 'application/dns-json' },
+    });
+    if (!resp.ok) throw new Error('DoH failed');
+    const data = await resp.json();
+    const ips = (data.Answer || []).filter(a => a.type === 1).map(a => a.data).filter(isPublicIP);
+    if (ips.length === 0) throw new Error('DoH no IPs');
+    return ips;
 }
 
 async function probeOne(addr) {
@@ -153,8 +166,13 @@ export default {
         const dohURL = env.DNS_RESOLVER_URL || DEFAULT_DOH;
         const proxyPort = env.PROXYPORT || null;
         const configProxyIP = env.PROXYIP || null;
-        if (!configProxyIP && _pool.length === 0) {
-            await refill();
+        if (!configProxyIP && _pool.length === 0 && (Date.now() - _lastRefillFail) > REFILL_RETRY_INTERVAL_MS) {
+            try {
+                await refill();
+            } catch (e) {
+                _lastRefillFail = Date.now();
+                console.error('[pool] cold start refill failed:', e);
+            }
         }
         const pool = configProxyIP ? [] : getPool();
         const proxyIP = configProxyIP || pool[Math.floor(Math.random() * pool.length)];
