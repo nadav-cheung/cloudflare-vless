@@ -8,47 +8,156 @@ const FALLBACK_PROXY_IPS = [
     '47.242.218.87',
     '8.219.245.214',
 ];
-const PROXY_CACHE_TTL = 30 * 60 * 1000; // 30 min
-const proxyCache = { ips: [], ts: 0 };
+const PROXY_IP_SOURCES = [
+    'https://ipdb.api.030101.xyz/?type=proxy',
+    'https://ipdb.api.030101.xyz/?type=bestproxy',
+];
+const POOL_MIN = 30;
+const POOL_MAX = 200;
+const PROBE_CONCURRENCY = 20;
+const PROBE_TIMEOUT_MS = 2000;
 const DEFAULT_DOH = 'https://cloudflare-dns.com/dns-query';
 const HTTPS_PORTS = [443, 8443, 2053, 2096, 2087, 2083];
 const TCP_TIMEOUT = 10_000;
 const WS_OPEN = 1;
 
+let _pool = [];
+let _refilling = null;
+
 if (!isValidUUID(DEFAULT_UUID)) throw new Error('Invalid default UUID');
 
-async function getProxyIP(env) {
-    if (env.PROXYIP) return env.PROXYIP;
+// ── Proxy IP Pool ──────────────────────────────────────────────────────
 
-    const now = Date.now();
-    if (proxyCache.ips.length && (now - proxyCache.ts) < PROXY_CACHE_TTL) {
-        return proxyCache.ips[Math.floor(Math.random() * proxyCache.ips.length)];
-    }
+function getPool() {
+    return _pool.length > 0 ? _pool : FALLBACK_PROXY_IPS;
+}
 
+async function healthCheck() {
+    if (_refilling) await _refilling;
+    if (_pool.length === 0) return;
+    const before = _pool.length;
+    _pool = await probeBatch(_pool);
+    console.log(`[pool] health check: ${_pool.length}/${before} alive`);
+}
+
+async function refill() {
+    if (_refilling) return _refilling;
+    _refilling = _doRefill().finally(() => { _refilling = null; });
+    return _refilling;
+}
+
+async function _doRefill() {
+    let raw;
     try {
-        const resp = await fetch('https://ipdb.api.030101.xyz/?type=bestproxy');
-        if (!resp.ok) throw new Error(`IPDB returned ${resp.status}`);
-        const text = await resp.text();
-        proxyCache.ips = text.trim().split('\n').filter(Boolean);
-        proxyCache.ts = now;
-    } catch {}
-
-    if (proxyCache.ips.length) {
-        return proxyCache.ips[Math.floor(Math.random() * proxyCache.ips.length)];
+        raw = await fetchIPDB();
+    } catch (err) {
+        console.error('[pool] fetchIPDB failed', err.errors || err);
+        return;
     }
-    return FALLBACK_PROXY_IPS[Math.floor(Math.random() * FALLBACK_PROXY_IPS.length)];
+    const existing = new Set(_pool);
+    const candidates = shuffle(raw.filter(ip => !existing.has(ip)));
+    const needed = POOL_MAX - _pool.length;
+    if (needed <= 0 || candidates.length === 0) return;
+    const alive = await probeBatch(candidates, needed);
+    const room = Math.max(0, POOL_MAX - _pool.length);
+    const toAdd = alive.slice(0, room);
+    _pool.push(...toAdd);
+    console.log(`[pool] refill: +${toAdd.length}, pool now ${_pool.length}`);
+}
+
+function isPublicIP(ip) {
+    const host = ip.includes(':') ? ip.split(':')[0] : ip;
+    const p = host.split('.').map(Number);
+    if (p.length !== 4 || p.some(x => isNaN(x) || x < 0 || x > 255)) return false;
+    if (p[0] === 10) return false;
+    if (p[0] === 172 && p[1] >= 16 && p[1] <= 31) return false;
+    if (p[0] === 192 && p[1] === 168) return false;
+    if (p[0] === 127) return false;
+    if (p[0] === 169 && p[1] === 254) return false;
+    if (p[0] === 0) return false;
+    if (p[0] === 100 && p[1] >= 64 && p[1] <= 127) return false;
+    return true;
+}
+
+async function fetchIPDB() {
+    const results = await Promise.allSettled(PROXY_IP_SOURCES.map(async (url) => {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 5000);
+        try {
+            const resp = await fetch(url, { signal: controller.signal });
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            const text = await resp.text();
+            const ips = text.trim().split('\n')
+                .map(s => s.trim())
+                .filter(s => s && !s.startsWith('#') && isPublicIP(s));
+            if (ips.length === 0) throw new Error('source empty');
+            return ips;
+        } finally {
+            clearTimeout(timer);
+        }
+    }));
+    const all = [];
+    for (const r of results) {
+        if (r.status === 'fulfilled') all.push(...r.value);
+    }
+    if (all.length === 0) throw new Error('all sources failed');
+    return [...new Set(all)];
+}
+
+async function probeOne(addr) {
+    const [host, portStr] = addr.includes(':') ? addr.split(':') : [addr, '443'];
+    const port = parseInt(portStr);
+    const sock = connect({ hostname: host, port });
+    try {
+        await Promise.race([
+            sock.opened,
+            new Promise((_, r) => setTimeout(() => r(new Error('timeout')), PROBE_TIMEOUT_MS)),
+        ]);
+    } finally {
+        sock.close();
+    }
+    return addr;
+}
+
+async function probeBatch(candidates, maxAlive = Infinity) {
+    const alive = [];
+    for (let i = 0; i < candidates.length && alive.length < maxAlive; i += PROBE_CONCURRENCY) {
+        const chunk = candidates.slice(i, i + PROBE_CONCURRENCY);
+        const results = await Promise.allSettled(chunk.map(addr => probeOne(addr)));
+        for (const r of results) {
+            if (r.status === 'fulfilled') {
+                alive.push(r.value);
+                if (alive.length >= maxAlive) break;
+            }
+        }
+    }
+    return alive;
+}
+
+function shuffle(arr) {
+    const a = [...arr];
+    for (let i = a.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [a[i], a[j]] = [a[j], a[i]];
+    }
+    return a;
 }
 
 // ── Router ─────────────────────────────────────────────────────────────
 
 export default {
-    async fetch(request, env) {
+    async fetch(request, env, ctx) {
         const uuid = env.UUID || DEFAULT_UUID;
         if (!isValidUUID(uuid)) return new Response('Invalid UUID', { status: 500 });
         const uuidBytes = uuidToBytes(uuid);
         const dohURL = env.DNS_RESOLVER_URL || DEFAULT_DOH;
-        const proxyIP = await getProxyIP(env);
         const proxyPort = env.PROXYPORT || null;
+        const configProxyIP = env.PROXYIP || null;
+        if (!configProxyIP && _pool.length === 0) {
+            await refill();
+        }
+        const pool = configProxyIP ? [] : getPool();
+        const proxyIP = configProxyIP || pool[Math.floor(Math.random() * pool.length)];
         const url = new URL(request.url);
 
         if (request.headers.get('Upgrade') === 'websocket') {
@@ -63,12 +172,20 @@ export default {
 
         return new Response('Not Found', { status: 404 });
     },
+
+    async scheduled(controller, env, ctx) {
+        await healthCheck();
+        if (_pool.length < POOL_MIN) {
+            await refill();
+        }
+    },
 };
 
 // ── VLESS over WebSocket ───────────────────────────────────────────────
 
 async function vlessOverWS(request, uuidBytes, proxyIP, proxyPort, dohURL) {
     const [client, ws] = Object.values(new WebSocketPair());
+    ws.binaryType = 'arraybuffer';
     ws.accept();
 
     const earlyData = decodeEarlyData(request.headers.get('sec-websocket-protocol') || '');
@@ -83,8 +200,11 @@ async function vlessOverWS(request, uuidBytes, proxyIP, proxyPort, dohURL) {
             }
             if (remoteRef.value) {
                 const writer = remoteRef.value.writable.getWriter();
-                await writer.write(chunk);
-                writer.releaseLock();
+                try {
+                    await writer.write(chunk);
+                } finally {
+                    writer.releaseLock();
+                }
                 return;
             }
 
@@ -100,7 +220,8 @@ async function vlessOverWS(request, uuidBytes, proxyIP, proxyPort, dohURL) {
                 return;
             }
 
-            relayTCP(hdr.address, hdr.port, payload, ws, respHeader, proxyIP, proxyPort, remoteRef);
+            relayTCP(hdr.address, hdr.port, payload, ws, respHeader, proxyIP, proxyPort, remoteRef)
+                .catch(err => { console.error('relayTCP failed', err); safeCloseWS(ws); });
         },
     })).catch(err => console.error('ws pipe error', err));
 
@@ -125,11 +246,12 @@ function parseVlessHeader(buf, expectedBytes) {
 
     const version = v[0];
     if (version !== 0x00) return { error: `Unsupported version: ${version}` };
-    for (let i = 0; i < 16; i++) {
-        if (v[1 + i] !== expectedBytes[i]) return { error: 'Invalid user' };
-    }
+    let diff = 0;
+    for (let i = 0; i < 16; i++) diff |= v[1 + i] ^ expectedBytes[i];
+    if (diff !== 0) return { error: 'Invalid user' };
 
     const addonsLen = v[17];
+    if (addonsLen > 32) return { error: 'Addons too long' };
     const cmdIdx = 18 + addonsLen;
     if (cmdIdx >= v.length) return { error: 'Truncated at command' };
 
@@ -201,34 +323,53 @@ async function relayTCP(address, port, initialData, ws, respHeader, proxyIP, pro
         }
 
         const writer = socket.writable.getWriter();
-        await writer.write(initialData);
-        writer.releaseLock();
+        try {
+            await writer.write(initialData);
+        } finally {
+            writer.releaseLock();
+        }
         return socket;
     }
 
     async function retry() {
         if (ws.readyState !== WS_OPEN) return;
-        // Close old socket before retrying
         const old = remoteRef.value;
         remoteRef.value = null;
         if (old) try { old.close(); } catch {}
-        try {
-            const socket = await connectAndWrite(proxyIP, proxyPort || port);
-            pipeRemoteToWS(socket, ws, respHeader, null);
-        } catch {
-            safeCloseWS(ws);
+
+        const pool = getPool();
+        if (pool.length === 0) { safeCloseWS(ws); return; }
+        const maxRetries = 4;
+        const tried = new Set();
+        const candidates = proxyIP && proxyIP !== address ? [proxyIP] : [];
+        for (let i = 0; i < maxRetries && tried.size < pool.length; i++) {
+            let idx;
+            do { idx = Math.floor(Math.random() * pool.length); } while (tried.has(idx));
+            tried.add(idx);
+            candidates.push(pool[idx]);
         }
+
+        for (const addr of candidates) {
+            const [host, portStr] = addr.includes(':') ? addr.split(':') : [addr, null];
+            const p = portStr ? parseInt(portStr) : (proxyPort || port);
+            try {
+                const socket = await connectAndWrite(host, p);
+                pipeRemoteToWS(socket, ws, respHeader, null);
+                return;
+            } catch { /* try next */ }
+        }
+        safeCloseWS(ws);
     }
 
     try {
         const socket = await connectAndWrite(address);
         pipeRemoteToWS(socket, ws, respHeader, retry);
     } catch {
-        if (proxyIP) {
-            retry();
-        } else {
-            safeCloseWS(ws);
+        if (remoteRef.value) {
+            try { remoteRef.value.close(); } catch {}
+            remoteRef.value = null;
         }
+        retry().catch(err => console.error('retry failed', err));
     }
 }
 
@@ -249,22 +390,34 @@ async function pipeRemoteToWS(socket, ws, respHeader, retryFn) {
                 }
             },
         }));
-    } catch {
+    } catch (err) {
+        console.error('pipeRemoteToWS error', err);
         safeCloseWS(ws);
     }
 
-    if (!hasData && retryFn && ws.readyState === WS_OPEN) retryFn();
+    if (!hasData && retryFn && ws.readyState === WS_OPEN) {
+        retryFn().catch(err => console.error('retryFn failed', err));
+    }
 }
 
 // ── DNS over HTTPS ─────────────────────────────────────────────────────
 // UDP data is framed as: [2-byte big-endian length][payload][2-byte length][payload]...
 // A single WebSocket message may contain partial framing — buffer handles cross-frame reassembly.
 
+const MAX_DNS_PACKET = 4096;
+const MAX_DNS_BUFFER = 65536;
+const MAX_PENDING_DNS = 16;
+
 async function handleDNS(ws, respHeader, initialChunk, dohURL) {
     let headerSent = false;
     let buffer = new Uint8Array(0);
+    let pending = 0;
 
     function append(data) {
+        if (buffer.length + data.length > MAX_DNS_BUFFER) {
+            safeCloseWS(ws);
+            throw new Error('DNS buffer overflow');
+        }
         const merged = new Uint8Array(buffer.length + data.length);
         merged.set(buffer, 0);
         merged.set(data, buffer.length);
@@ -276,6 +429,10 @@ async function handleDNS(ws, respHeader, initialChunk, dohURL) {
         let off = 0;
         while (off + 2 <= buffer.length) {
             const len = (buffer[off] << 8) | buffer[off + 1];
+            if (len === 0 || len > MAX_DNS_PACKET) {
+                off += 2;
+                continue;
+            }
             if (off + 2 + len > buffer.length) break;
             packets.push(buffer.slice(off + 2, off + 2 + len));
             off += 2 + len;
@@ -285,12 +442,18 @@ async function handleDNS(ws, respHeader, initialChunk, dohURL) {
     }
 
     async function resolve(data) {
+        if (pending >= MAX_PENDING_DNS) {
+            console.warn(`DNS query dropped: ${pending} pending (limit ${MAX_PENDING_DNS})`);
+            return;
+        }
+        pending++;
         try {
             const resp = await fetch(dohURL, {
                 method: 'POST',
                 headers: { 'content-type': 'application/dns-message' },
                 body: data,
             });
+            if (!resp.ok) throw new Error(`DoH returned ${resp.status}`);
             const result = new Uint8Array(await resp.arrayBuffer());
             const sizeHdr = new Uint8Array([(result.length >> 8) & 0xff, result.length & 0xff]);
 
@@ -303,6 +466,8 @@ async function handleDNS(ws, respHeader, initialChunk, dohURL) {
             }
         } catch (err) {
             console.error('DNS resolve error', err);
+        } finally {
+            pending--;
         }
     }
 
@@ -320,11 +485,12 @@ async function handleDNS(ws, respHeader, initialChunk, dohURL) {
 // ── Subscription Generator ─────────────────────────────────────────────
 
 function generateSub(uuid, host, proxyIP) {
+    const proxyHost = proxyIP && proxyIP.includes(':') ? proxyIP.split(':')[0] : proxyIP;
     const base = `?encryption=none&security=tls&sni=${host}&fp=random&type=ws&host=${host}&path=%2F%3Fed%3D2048`;
     const lines = [];
     for (const port of HTTPS_PORTS) {
         lines.push(`vless://${uuid}@${host}:${port}${base}#${host}-${port}`);
-        lines.push(`vless://${uuid}@${proxyIP}:${port}${base}#${host}-${proxyIP}-${port}`);
+        lines.push(`vless://${uuid}@${proxyHost}:${port}${base}#${host}-${proxyHost}-${port}`);
     }
     return lines.join('\n');
 }
