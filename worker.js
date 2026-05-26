@@ -111,7 +111,14 @@ async function fetchIPDB() {
     for (const r of results) {
         if (r.status === 'fulfilled') all.push(...r.value);
     }
-    if (all.length === 0) return await resolveDoH();
+    try {
+        const doh = await resolveDoH();
+        console.log(`[ipdb] DoH: ${doh.length} IPs`);
+        all.push(...doh);
+    } catch (e) {
+        console.log(`[ipdb] DoH: failed - ${e.message}`);
+    }
+    if (all.length === 0) throw new Error('all sources empty');
     return [...new Set(all)];
 }
 
