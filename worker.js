@@ -3,13 +3,41 @@ import { connect } from 'cloudflare:sockets';
 // ── Configuration ──────────────────────────────────────────────────────
 
 const DEFAULT_UUID = '80e753d7-3195-4302-a881-50d71d0030e2';
-const PROXY_IPS = ['cdn.xn--b6gac.eu.org', 'cdn-all.xn--b6gac.eu.org', 'workers.bestip.one'];
+const FALLBACK_PROXY_IPS = [
+    '8.212.12.98',
+    '47.242.218.87',
+    '8.219.245.214',
+];
+const PROXY_CACHE_TTL = 30 * 60 * 1000; // 30 min
+const proxyCache = { ips: [], ts: 0 };
 const DEFAULT_DOH = 'https://cloudflare-dns.com/dns-query';
 const HTTPS_PORTS = [443, 8443, 2053, 2096, 2087, 2083];
 const TCP_TIMEOUT = 10_000;
 const WS_OPEN = 1;
 
 if (!isValidUUID(DEFAULT_UUID)) throw new Error('Invalid default UUID');
+
+async function getProxyIP(env) {
+    if (env.PROXYIP) return env.PROXYIP;
+
+    const now = Date.now();
+    if (proxyCache.ips.length && (now - proxyCache.ts) < PROXY_CACHE_TTL) {
+        return proxyCache.ips[Math.floor(Math.random() * proxyCache.ips.length)];
+    }
+
+    try {
+        const resp = await fetch('https://ipdb.api.030101.xyz/?type=bestproxy');
+        if (!resp.ok) throw new Error(`IPDB returned ${resp.status}`);
+        const text = await resp.text();
+        proxyCache.ips = text.trim().split('\n').filter(Boolean);
+        proxyCache.ts = now;
+    } catch {}
+
+    if (proxyCache.ips.length) {
+        return proxyCache.ips[Math.floor(Math.random() * proxyCache.ips.length)];
+    }
+    return FALLBACK_PROXY_IPS[Math.floor(Math.random() * FALLBACK_PROXY_IPS.length)];
+}
 
 // ── Router ─────────────────────────────────────────────────────────────
 
@@ -19,11 +47,12 @@ export default {
         if (!isValidUUID(uuid)) return new Response('Invalid UUID', { status: 500 });
         const uuidBytes = uuidToBytes(uuid);
         const dohURL = env.DNS_RESOLVER_URL || DEFAULT_DOH;
-        const proxyIP = env.PROXYIP || PROXY_IPS[Math.floor(Math.random() * PROXY_IPS.length)];
+        const proxyIP = await getProxyIP(env);
+        const proxyPort = env.PROXYPORT || null;
         const url = new URL(request.url);
 
         if (request.headers.get('Upgrade') === 'websocket') {
-            return vlessOverWS(request, uuidBytes, proxyIP, dohURL);
+            return vlessOverWS(request, uuidBytes, proxyIP, proxyPort, dohURL);
         }
 
         if (url.pathname === `/sub/${uuid}`) {
@@ -38,7 +67,7 @@ export default {
 
 // ── VLESS over WebSocket ───────────────────────────────────────────────
 
-async function vlessOverWS(request, uuidBytes, proxyIP, dohURL) {
+async function vlessOverWS(request, uuidBytes, proxyIP, proxyPort, dohURL) {
     const [client, ws] = Object.values(new WebSocketPair());
     ws.accept();
 
@@ -71,7 +100,7 @@ async function vlessOverWS(request, uuidBytes, proxyIP, dohURL) {
                 return;
             }
 
-            relayTCP(hdr.address, hdr.port, payload, ws, respHeader, proxyIP, remoteRef);
+            relayTCP(hdr.address, hdr.port, payload, ws, respHeader, proxyIP, proxyPort, remoteRef);
         },
     })).catch(err => console.error('ws pipe error', err));
 
@@ -153,9 +182,9 @@ function parseVlessHeader(buf, expectedBytes) {
 
 // ── TCP Relay ──────────────────────────────────────────────────────────
 
-async function relayTCP(address, port, initialData, ws, respHeader, proxyIP, remoteRef) {
-    async function connectAndWrite(addr) {
-        const socket = connect({ hostname: addr, port });
+async function relayTCP(address, port, initialData, ws, respHeader, proxyIP, proxyPort, remoteRef) {
+    async function connectAndWrite(addr, connectPort) {
+        const socket = connect({ hostname: addr, port: connectPort || port });
         remoteRef.value = socket;
 
         let timer;
@@ -184,7 +213,7 @@ async function relayTCP(address, port, initialData, ws, respHeader, proxyIP, rem
         remoteRef.value = null;
         if (old) try { old.close(); } catch {}
         try {
-            const socket = await connectAndWrite(proxyIP);
+            const socket = await connectAndWrite(proxyIP, proxyPort || port);
             pipeRemoteToWS(socket, ws, respHeader, null);
         } catch {
             safeCloseWS(ws);
