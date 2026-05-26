@@ -2,7 +2,8 @@
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/nadav-cheung/cloudflare-vless)
 
-[English](README.md)
+[![en](https://img.shields.io/badge/lang-English-blue.svg)](README.md)
+[![zh](https://img.shields.io/badge/lang-中文-red.svg)](README_CN.md)
 
 基于 Cloudflare Workers 的 VLESS over WebSocket 代理。
 
