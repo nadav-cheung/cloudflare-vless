@@ -4,9 +4,10 @@ import { connect } from 'cloudflare:sockets';
 
 const DEFAULT_UUID = '80e753d7-3195-4302-a881-50d71d0030e2';
 const FALLBACK_PROXY_IPS = [
-    '8.212.12.98',
-    '47.242.218.87',
-    '8.219.245.214',
+    '166.1.160.140',
+    '107.172.16.110',
+    '64.188.27.145',
+    '43.169.18.179',
 ];
 const PROXY_IP_SOURCES = [
     'https://ipdb.api.030101.xyz/?type=proxy',
