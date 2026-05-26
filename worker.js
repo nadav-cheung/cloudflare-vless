@@ -96,7 +96,13 @@ async function fetchIPDB() {
                 .map(s => s.trim())
                 .filter(s => s && !s.startsWith('#') && isPublicIP(s));
             if (ips.length === 0) throw new Error('source empty');
+            const tag = new URL(url).search || new URL(url).pathname.split('/').pop();
+            console.log(`[ipdb] ${tag}: ${ips.length} IPs`);
             return ips;
+        } catch (e) {
+            const tag = new URL(url).search || new URL(url).pathname.split('/').pop();
+            console.log(`[ipdb] ${tag}: failed - ${e.message}`);
+            throw e;
         } finally {
             clearTimeout(timer);
         }
