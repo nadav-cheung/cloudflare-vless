@@ -95,6 +95,7 @@ function parseVlessHeader(buf, expectedBytes) {
     if (v.length < 26) return { error: 'Header too short' };
 
     const version = v[0];
+    if (version !== 0x00) return { error: `Unsupported version: ${version}` };
     for (let i = 0; i < 16; i++) {
         if (v[1 + i] !== expectedBytes[i]) return { error: 'Invalid user' };
     }
@@ -177,6 +178,11 @@ async function relayTCP(address, port, initialData, ws, respHeader, proxyIP, rem
     }
 
     async function retry() {
+        if (ws.readyState !== WS_OPEN) return;
+        // Close old socket before retrying
+        const old = remoteRef.value;
+        remoteRef.value = null;
+        if (old) try { old.close(); } catch {}
         try {
             const socket = await connectAndWrite(proxyIP);
             pipeRemoteToWS(socket, ws, respHeader, null);
@@ -218,7 +224,7 @@ async function pipeRemoteToWS(socket, ws, respHeader, retryFn) {
         safeCloseWS(ws);
     }
 
-    if (!hasData && retryFn) retryFn();
+    if (!hasData && retryFn && ws.readyState === WS_OPEN) retryFn();
 }
 
 // ── DNS over HTTPS ─────────────────────────────────────────────────────
