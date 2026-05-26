@@ -10,6 +10,8 @@ const FALLBACK_PROXY_IPS = [
     '43.169.18.179',
 ];
 const PROXY_IP_SOURCES = [
+    'https://raw.githubusercontent.com/ymyuuu/IPDB/master/BestProxy/proxy.txt',
+    'https://raw.githubusercontent.com/ymyuuu/IPDB/master/BestProxy/bestproxy.txt',
     'https://ipdb.api.030101.xyz/?type=proxy',
     'https://ipdb.api.030101.xyz/?type=bestproxy',
 ];
