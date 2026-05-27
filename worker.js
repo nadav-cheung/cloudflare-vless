@@ -70,7 +70,7 @@ async function quickRefill() {
         for (const r of [dohResult, ghResult]) {
             if (r.status === 'fulfilled') {
                 for (const ip of r.value) {
-                    if (!existing.has(ip)) {
+                    if (!existing.has(ip) && isPublicIP(ip)) {
                         candidates.push(ip);
                         existing.add(ip);
                     }
@@ -120,7 +120,7 @@ async function _doRefill() {
         }
 
         const existing = new Set(_pool);
-        const candidates = [...new Set(ips.filter(ip => !existing.has(ip)))];
+        const candidates = [...new Set(ips.filter(ip => !existing.has(ip) && isPublicIP(ip)))];
         if (candidates.length === 0) {
             console.log(`[refill] ${tier.name}: 0 new IPs, skip`);
             continue;
@@ -140,16 +140,20 @@ async function _doRefill() {
 }
 
 function isPublicIP(ip) {
-    const host = ip.includes(':') ? ip.split(':')[0] : ip;
-    const p = host.split('.').map(Number);
-    if (p.length !== 4 || p.some(x => isNaN(x) || x < 0 || x > 255)) return false;
-    if (p[0] === 10) return false;
-    if (p[0] === 172 && p[1] >= 16 && p[1] <= 31) return false;
-    if (p[0] === 192 && p[1] === 168) return false;
-    if (p[0] === 127) return false;
-    if (p[0] === 169 && p[1] === 254) return false;
-    if (p[0] === 0) return false;
-    if (p[0] === 100 && p[1] >= 64 && p[1] <= 127) return false;
+    const parts = ip.includes(':') ? null : ip.split('.').map(Number);
+    if (!parts || parts.length !== 4 || parts.some(p => isNaN(p) || p < 0 || p > 255)) return false;
+    const [a, b, c, d] = parts;
+    if (a === 0 || a === 127) return false;
+    if (a === 10) return false;
+    if (a === 172 && b >= 16 && b <= 31) return false;
+    if (a === 192 && b === 168) return false;
+    if (a === 169 && b === 254) return false;
+    if (a === 100 && b >= 64 && b <= 127) return false;
+    if (a === 192 && b === 0 && c === 0) return false;
+    if (a === 198 && b === 51 && c === 100) return false;
+    if (a === 203 && b === 0 && c === 113) return false;
+    if (a === 224) return false;
+    if (a >= 240) return false;
     return true;
 }
 
