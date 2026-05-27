@@ -22,8 +22,8 @@ const PROXYIP_DOH_DOMAINS = [
 ];
 const POOL_MIN = 20;
 const POOL_MAX = 200;
-const PROBE_CONCURRENCY = 20;
-const PROBE_TIMEOUT_MS = 2000;
+const PROBE_CONCURRENCY = 30;
+const PROBE_TIMEOUT_MS = 5000;
 const DEFAULT_DOH = 'https://cloudflare-dns.com/dns-query';
 const HTTPS_PORTS = [443, 8443, 2053, 2096, 2087, 2083];
 const TCP_TIMEOUT = 10_000;
@@ -31,6 +31,7 @@ const WS_OPEN = 1;
 
 let _pool = [];
 let _refilling = null;
+let _refillingStart = 0;
 let _lastRefillFail = 0;
 const REFILL_RETRY_INTERVAL_MS = 60_000;
 
@@ -54,9 +55,44 @@ async function healthCheck() {
     if (dead.length > 0) console.log(`[health] removed: ${dead.join(', ')}`);
 }
 
+async function quickRefill() {
+    if (_refilling) return;
+    const existing = new Set(_pool);
+    const candidates = [];
+    const [dohResult, ghResult] = await Promise.allSettled([
+        resolveDoH(),
+        fetchSourceURL(SOURCE_TIERS[1].url),
+    ]);
+    for (const r of [dohResult, ghResult]) {
+        if (r.status === 'fulfilled') {
+            for (const ip of r.value) {
+                if (!existing.has(ip)) {
+                    candidates.push(ip);
+                    existing.add(ip);
+                }
+            }
+        }
+    }
+    if (candidates.length === 0) return;
+    console.log(`[quick-refill] probing ${candidates.length}`);
+    const alive = await probeBatch(candidates);
+    const room = Math.max(0, POOL_MAX - _pool.length);
+    const toAdd = alive.slice(0, room);
+    _pool.push(...toAdd);
+    console.log(`[quick-refill] +${toAdd.length} added, pool=${_pool.length}`);
+}
+
 async function refill() {
-    if (_refilling) return _refilling;
-    _refilling = _doRefill().finally(() => { _refilling = null; });
+    if (_refilling) {
+        if (_refillingStart && Date.now() - _refillingStart > 90_000) {
+            console.error('[refill] stuck lock detected, clearing');
+            _refilling = null;
+        } else {
+            return _refilling;
+        }
+    }
+    _refillingStart = Date.now();
+    _refilling = _doRefill().finally(() => { _refilling = null; _refillingStart = 0; });
     return _refilling;
 }
 
@@ -196,10 +232,15 @@ export default {
         const proxyPort = env.PROXYPORT || null;
         const configProxyIP = env.PROXYIP || null;
         if (!configProxyIP && _pool.length === 0 && (Date.now() - _lastRefillFail) > REFILL_RETRY_INTERVAL_MS) {
-            ctx.waitUntil(refill().catch(e => {
-                _lastRefillFail = Date.now();
-                console.error('[pool] cold start refill failed:', e);
-            }));
+            try {
+                await Promise.race([
+                    quickRefill(),
+                    new Promise((_, r) => setTimeout(() => r(new Error('timeout')), 10_000)),
+                ]);
+            } catch (e) {
+                console.error('[pool] quick-refill:', e.message);
+            }
+            if (_pool.length === 0) _lastRefillFail = Date.now();
         }
         const pool = configProxyIP ? [] : getPool();
         const proxyIP = configProxyIP || pool[Math.floor(Math.random() * pool.length)];
