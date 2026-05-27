@@ -9,13 +9,18 @@ const FALLBACK_PROXY_IPS = [
     '64.188.27.145',
     '43.169.18.179',
 ];
-const PROXY_IP_SOURCES = [
-    'https://raw.githubusercontent.com/ymyuuu/IPDB/master/BestProxy/proxy.txt',
-    'https://raw.githubusercontent.com/ymyuuu/IPDB/master/BestProxy/bestproxy.txt',
-    'https://ipdb.api.030101.xyz/?type=proxy',
-    'https://ipdb.api.030101.xyz/?type=bestproxy',
+const SOURCE_TIERS = [
+    { name: 'doh', type: 'doh' },
+    { name: 'gh-bestproxy', url: 'https://raw.githubusercontent.com/ymyuuu/IPDB/master/BestProxy/bestproxy.txt' },
+    { name: 'gh-proxy', url: 'https://raw.githubusercontent.com/ymyuuu/IPDB/master/BestProxy/proxy.txt' },
+    { name: 'gh-proxy-root', url: 'https://raw.githubusercontent.com/ymyuuu/IPDB/master/proxy.txt' },
+    { name: 'api-bestproxy', url: 'https://ipdb.api.030101.xyz/?type=bestproxy' },
+    { name: 'api-proxy', url: 'https://ipdb.api.030101.xyz/?type=proxy' },
 ];
-const POOL_MIN = 30;
+const PROXYIP_DOH_DOMAINS = [
+    'proxyip.cmliussss.net',
+];
+const POOL_MIN = 20;
 const POOL_MAX = 200;
 const PROBE_CONCURRENCY = 20;
 const PROBE_TIMEOUT_MS = 2000;
@@ -40,9 +45,13 @@ function getPool() {
 async function healthCheck() {
     if (_refilling) await _refilling;
     if (_pool.length === 0) return;
-    const before = _pool.length;
-    _pool = await probeBatch(_pool);
-    console.log(`[pool] health check: ${_pool.length}/${before} alive`);
+    const before = [..._pool];
+    const start = Date.now();
+    const alive = await probeBatch(_pool);
+    const dead = before.filter(ip => !alive.includes(ip));
+    _pool = alive;
+    console.log(`[health] ${alive.length}/${before.length} alive, ${dead.length} dead (${Date.now() - start}ms)`);
+    if (dead.length > 0) console.log(`[health] removed: ${dead.join(', ')}`);
 }
 
 async function refill() {
@@ -52,22 +61,36 @@ async function refill() {
 }
 
 async function _doRefill() {
-    let raw;
-    try {
-        raw = await fetchIPDB();
-    } catch (err) {
-        console.error('[pool] fetchIPDB failed', err.errors || err);
-        return;
+    const start = Date.now();
+    for (const tier of SOURCE_TIERS) {
+        if (_pool.length >= POOL_MAX) break;
+
+        let ips;
+        try {
+            ips = tier.type === 'doh' ? await resolveDoH() : await fetchSourceURL(tier.url);
+        } catch (e) {
+            console.log(`[refill] ${tier.name}: fetch failed - ${e.message}`);
+            continue;
+        }
+
+        const existing = new Set(_pool);
+        const candidates = [...new Set(ips.filter(ip => !existing.has(ip)))];
+        if (candidates.length === 0) {
+            console.log(`[refill] ${tier.name}: 0 new IPs, skip`);
+            continue;
+        }
+
+        const needed = POOL_MAX - _pool.length;
+        const tierStart = Date.now();
+        console.log(`[refill] ${tier.name}: probing ${candidates.length} (need ${needed})`);
+        const alive = await probeBatch(candidates, needed);
+        const room = Math.max(0, POOL_MAX - _pool.length);
+        const toAdd = alive.slice(0, room);
+        _pool.push(...toAdd);
+        if (_pool.length > POOL_MAX) _pool.length = POOL_MAX;
+        console.log(`[refill] ${tier.name}: ${candidates.length} probed, ${alive.length} alive, +${toAdd.length} added, pool=${_pool.length} (${Date.now() - tierStart}ms)`);
     }
-    const existing = new Set(_pool);
-    const candidates = shuffle(raw.filter(ip => !existing.has(ip)));
-    const needed = POOL_MAX - _pool.length;
-    if (needed <= 0 || candidates.length === 0) return;
-    const alive = await probeBatch(candidates, needed);
-    const room = Math.max(0, POOL_MAX - _pool.length);
-    const toAdd = alive.slice(0, room);
-    _pool.push(...toAdd);
-    console.log(`[pool] refill: +${toAdd.length}, pool now ${_pool.length}`);
+    console.log(`[refill] done: pool=${_pool.length} total=${Date.now() - start}ms`);
 }
 
 function isPublicIP(ip) {
@@ -84,64 +107,63 @@ function isPublicIP(ip) {
     return true;
 }
 
-async function fetchIPDB() {
-    const results = await Promise.allSettled(PROXY_IP_SOURCES.map(async (url) => {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 5000);
-        try {
-            const resp = await fetch(url, { signal: controller.signal });
-            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-            const text = await resp.text();
-            const ips = text.trim().split('\n')
-                .map(s => s.trim())
-                .filter(s => s && !s.startsWith('#') && isPublicIP(s));
-            if (ips.length === 0) throw new Error('source empty');
-            const tag = new URL(url).search || new URL(url).pathname.split('/').pop();
-            console.log(`[ipdb] ${tag}: ${ips.length} IPs`);
-            return ips;
-        } catch (e) {
-            const tag = new URL(url).search || new URL(url).pathname.split('/').pop();
-            console.log(`[ipdb] ${tag}: failed - ${e.message}`);
-            throw e;
-        } finally {
-            clearTimeout(timer);
-        }
-    }));
-    const all = [];
-    for (const r of results) {
-        if (r.status === 'fulfilled') all.push(...r.value);
-    }
+async function fetchSourceURL(url) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
     try {
-        const doh = await resolveDoH();
-        console.log(`[ipdb] DoH: ${doh.length} IPs`);
-        all.push(...doh);
-    } catch (e) {
-        console.log(`[ipdb] DoH: failed - ${e.message}`);
+        const resp = await fetch(url, { signal: controller.signal });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const text = await resp.text();
+        const ips = text.trim().split('\n')
+            .map(s => s.trim())
+            .filter(s => s && !s.startsWith('#') && isPublicIP(s));
+        if (ips.length === 0) throw new Error('empty');
+        const parsed = new URL(url);
+        const tag = parsed.search || parsed.pathname.split('/').pop() || parsed.hostname;
+        console.log(`[ipdb] ${tag}: ${ips.length} IPs`);
+        return ips;
+    } finally {
+        clearTimeout(timer);
     }
-    if (all.length === 0) throw new Error('all sources empty');
-    return [...new Set(all)];
 }
 
 async function resolveDoH() {
-    const resp = await fetch('https://cloudflare-dns.com/dns-query?name=proxyip.cmliussss.net&type=A', {
-        headers: { accept: 'application/dns-json' },
-    });
-    if (!resp.ok) throw new Error('DoH failed');
-    const data = await resp.json();
-    const ips = (data.Answer || []).filter(a => a.type === 1).map(a => a.data).filter(isPublicIP);
-    if (ips.length === 0) throw new Error('DoH no IPs');
-    return ips;
+    const all = [];
+    const results = await Promise.allSettled(PROXYIP_DOH_DOMAINS.map(async (domain) => {
+        const resp = await fetch(`https://cloudflare-dns.com/dns-query?name=${domain}&type=A`, {
+            headers: { accept: 'application/dns-json' },
+        });
+        if (!resp.ok) throw new Error(`DoH ${domain}: HTTP ${resp.status}`);
+        const data = await resp.json();
+        const ips = (data.Answer || []).filter(a => a.type === 1).map(a => a.data);
+        if (ips.length === 0) throw new Error(`DoH ${domain}: no IPs`);
+        console.log(`[doh] ${domain}: ${ips.length} IPs`);
+        return ips;
+    }));
+    for (const r of results) {
+        if (r.status === 'fulfilled' && r.value) all.push(...r.value);
+    }
+    if (all.length === 0) throw new Error('DoH: all domains failed');
+    return [...new Set(all)];
 }
 
 async function probeOne(addr) {
     const [host, portStr] = addr.includes(':') ? addr.split(':') : [addr, '443'];
     const port = parseInt(portStr);
+    if (!Number.isFinite(port) || port < 1 || port > 65535) {
+        throw new Error(`invalid port: ${addr}`);
+    }
+    const start = Date.now();
     const sock = connect({ hostname: host, port });
     try {
         await Promise.race([
             sock.opened,
             new Promise((_, r) => setTimeout(() => r(new Error('timeout')), PROBE_TIMEOUT_MS)),
         ]);
+        console.log(`[probe] ${addr} OK ${Date.now() - start}ms`);
+    } catch (e) {
+        console.log(`[probe] ${addr} FAIL ${Date.now() - start}ms ${e.message}`);
+        throw e;
     } finally {
         sock.close();
     }
@@ -163,15 +185,6 @@ async function probeBatch(candidates, maxAlive = Infinity) {
     return alive;
 }
 
-function shuffle(arr) {
-    const a = [...arr];
-    for (let i = a.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [a[i], a[j]] = [a[j], a[i]];
-    }
-    return a;
-}
-
 // ── Router ─────────────────────────────────────────────────────────────
 
 export default {
@@ -183,12 +196,10 @@ export default {
         const proxyPort = env.PROXYPORT || null;
         const configProxyIP = env.PROXYIP || null;
         if (!configProxyIP && _pool.length === 0 && (Date.now() - _lastRefillFail) > REFILL_RETRY_INTERVAL_MS) {
-            try {
-                await refill();
-            } catch (e) {
+            ctx.waitUntil(refill().catch(e => {
                 _lastRefillFail = Date.now();
                 console.error('[pool] cold start refill failed:', e);
-            }
+            }));
         }
         const pool = configProxyIP ? [] : getPool();
         const proxyIP = configProxyIP || pool[Math.floor(Math.random() * pool.length)];
