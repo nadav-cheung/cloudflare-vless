@@ -1,6 +1,6 @@
 name = "cloudflare-vless"
 main = "worker.js"
-compatibility_date = "2026-05-27"
+compatibility_date = "2026-05-26"
 
 [vars]
 UUID = "7b84ddae-ed2c-4b87-9fe9-f396d1bdb446"
