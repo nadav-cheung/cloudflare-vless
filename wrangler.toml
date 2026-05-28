@@ -1,9 +1,9 @@
 name = "cloudflare-vless"
 main = "worker.js"
-compatibility_date = "2024-09-23"
+compatibility_date = "2026-05-27"
 
 [vars]
-UUID = "80e753d7-3195-4302-a881-50d71d0030e2"
+UUID = "7b84ddae-ed2c-4b87-9fe9-f396d1bdb446"
 PROXYIP = ""
 
 # For sensitive values, prefer `wrangler secret put` over [vars]:
