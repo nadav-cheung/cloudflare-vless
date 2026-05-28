@@ -11,7 +11,7 @@ PROXYIP = ""
 #   wrangler secret put PROXYIP
 
 [triggers]
-crons = ["*/10 * * * *"]
+crons = ["*/3 * * * *"]
 
 [observability]
 enabled = true
