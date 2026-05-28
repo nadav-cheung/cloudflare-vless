@@ -78,10 +78,10 @@ async function quickRefill() {
             }
         }
         if (candidates.length === 0) return;
-        console.log(`[quick-refill] probing ${candidates.length}`);
-        const alive = await probeBatch(candidates);
-        const room = Math.max(0, POOL_MAX - _pool.length);
-        const toAdd = alive.slice(0, room);
+        const needed = Math.max(0, POOL_MAX - _pool.length);
+        console.log(`[quick-refill] probing ${candidates.length} (need ${needed})`);
+        const alive = await probeBatch(candidates, needed);
+        const toAdd = alive.slice(0, needed);
         _pool.push(...toAdd);
         console.log(`[quick-refill] +${toAdd.length} added, pool=${_pool.length}`);
     } finally {
@@ -243,7 +243,17 @@ export default {
         if (!isValidUUID(uuid)) return new Response('Invalid UUID', { status: 500 });
         const uuidBytes = uuidToBytes(uuid);
         const dohURL = env.DNS_RESOLVER_URL || DEFAULT_DOH;
-        const proxyPort = env.PROXYPORT || null;
+        const upgradeHeader = request.headers.get('Upgrade');
+        if (!upgradeHeader || upgradeHeader.toLowerCase() !== 'websocket') {
+            const url = new URL(request.url);
+            if (url.pathname === `/sub/${uuid}`) {
+                return new Response(btoa(generateSub(uuid, url.hostname)), {
+                    headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+                });
+            }
+            return new Response('Not Found', { status: 404 });
+        }
+
         const configProxyIP = env.PROXYIP || null;
         if (!configProxyIP && _pool.length === 0 && !_refilling && (Date.now() - _lastRefillFail) > REFILL_RETRY_INTERVAL_MS) {
             try {
@@ -258,19 +268,8 @@ export default {
         }
         const pool = configProxyIP ? [] : getPool();
         const proxyIP = configProxyIP || pool[Math.floor(Math.random() * pool.length)];
-        const url = new URL(request.url);
-
-        if (request.headers.get('Upgrade') === 'websocket') {
-            return vlessOverWS(request, uuidBytes, proxyIP, proxyPort, dohURL);
-        }
-
-        if (url.pathname === `/sub/${uuid}`) {
-            return new Response(btoa(generateSub(uuid, url.hostname)), {
-                headers: { 'Content-Type': 'text/plain; charset=utf-8' },
-            });
-        }
-
-        return new Response('Not Found', { status: 404 });
+        const proxyPort = env.PROXYPORT || null;
+        return vlessOverWS(request, uuidBytes, proxyIP, proxyPort, dohURL);
     },
 
     async scheduled(controller, env, ctx) {
