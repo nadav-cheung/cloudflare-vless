@@ -20,13 +20,14 @@ const SOURCE_TIERS = [
 const PROXYIP_DOH_DOMAINS = [
     'proxyip.cmliussss.net',
 ];
-const POOL_MIN = 10;
-const POOL_MAX = 50;
+const POOL_MIN = 4;
+const POOL_MAX = 16;
 const PROBE_CONCURRENCY = 6;
-const PROBE_TIMEOUT_MS = 100;
+const PROBE_TIMEOUT_MS = 60;
 const DEFAULT_DOH = 'https://cloudflare-dns.com/dns-query';
 const HTTPS_PORTS = [443, 8443, 2053, 2096, 2087, 2083];
 const TCP_TIMEOUT = 10_000;
+const RETRY_TIMEOUT = 5_000;
 const WS_OPEN = 1;
 
 let _pool = [];
@@ -45,8 +46,17 @@ function getPool() {
     return _pool.length > 0 ? _pool : FALLBACK_PROXY_IPS;
 }
 
+function addToPool(ips) {
+    const existing = new Set(_pool);
+    const unique = ips.filter(ip => !existing.has(ip));
+    const room = Math.max(0, POOL_MAX - _pool.length);
+    const toAdd = unique.slice(0, room);
+    _pool.push(...toAdd);
+    if (_pool.length > POOL_MAX) _pool.length = POOL_MAX;
+    return toAdd.length;
+}
+
 async function healthCheck() {
-    if (_refilling) await _refilling;
     if (_pool.length === 0) return;
     const before = [..._pool];
     const start = Date.now();
@@ -81,9 +91,8 @@ async function quickRefill() {
         const needed = Math.max(0, POOL_MAX - _pool.length);
         console.log(`[quick-refill] probing ${candidates.length} (need ${needed})`);
         const alive = await probeBatch(candidates, needed);
-        const toAdd = alive.slice(0, needed);
-        _pool.push(...toAdd);
-        console.log(`[quick-refill] +${toAdd.length} added, pool=${_pool.length}`);
+        const added = addToPool(alive);
+        console.log(`[quick-refill] +${added} added, pool=${_pool.length}`);
     } finally {
         _quickRefilling = false;
     }
@@ -130,11 +139,8 @@ async function _doRefill() {
         const tierStart = Date.now();
         console.log(`[refill] ${tier.name}: probing ${candidates.length} (need ${needed})`);
         const alive = await probeBatch(candidates, needed);
-        const room = Math.max(0, POOL_MAX - _pool.length);
-        const toAdd = alive.slice(0, room);
-        _pool.push(...toAdd);
-        if (_pool.length > POOL_MAX) _pool.length = POOL_MAX;
-        console.log(`[refill] ${tier.name}: ${candidates.length} probed, ${alive.length} alive, +${toAdd.length} added, pool=${_pool.length} (${Date.now() - tierStart}ms)`);
+        const added = addToPool(alive);
+        console.log(`[refill] ${tier.name}: ${candidates.length} probed, ${alive.length} alive, +${added} added, pool=${_pool.length} (${Date.now() - tierStart}ms)`);
     }
     console.log(`[refill] done: pool=${_pool.length} total=${Date.now() - start}ms`);
 }
@@ -198,21 +204,22 @@ async function resolveDoH() {
 }
 
 async function probeOne(addr) {
-    const [host, portStr] = addr.includes(':') ? addr.split(':') : [addr, '443'];
-    const port = parseInt(portStr);
+    const [host, port] = parseHostPort(addr, 443);
     if (!Number.isFinite(port) || port < 1 || port > 65535) {
         throw new Error(`invalid port: ${addr}`);
     }
     const sock = connect({ hostname: host, port });
+    let timer;
     try {
         await Promise.race([
             sock.opened,
-            new Promise((_, r) => setTimeout(() => r(new Error('timeout')), PROBE_TIMEOUT_MS)),
+            new Promise((_, r) => { timer = setTimeout(() => r(new Error('timeout')), PROBE_TIMEOUT_MS); }),
         ]);
     } catch (e) {
         console.log(`[probe] ${addr} FAIL ${e.message}`);
         throw e;
     } finally {
+        clearTimeout(timer);
         sock.close();
     }
     return addr;
@@ -254,15 +261,11 @@ export default {
 
         const configProxyIP = env.PROXYIP || null;
         if (!configProxyIP && _pool.length === 0 && !_refilling && (Date.now() - _lastRefillFail) > REFILL_RETRY_INTERVAL_MS) {
-            try {
-                await Promise.race([
-                    quickRefill(),
-                    new Promise((_, r) => setTimeout(() => r(new Error('timeout')), 15_000)),
-                ]);
-            } catch (e) {
-                console.error('[pool] quick-refill:', e.message);
-            }
-            if (_pool.length === 0) _lastRefillFail = Date.now();
+            ctx.waitUntil(
+                quickRefill()
+                    .catch(e => console.error('[pool] quick-refill:', e.message))
+                    .then(() => { if (_pool.length === 0) _lastRefillFail = Date.now(); })
+            );
         }
         const pool = configProxyIP ? [] : getPool();
         const proxyIP = configProxyIP || pool[Math.floor(Math.random() * pool.length)];
@@ -286,8 +289,10 @@ async function vlessOverWS(request, uuidBytes, proxyIP, proxyPort, dohURL) {
     ws.accept();
 
     const earlyData = decodeEarlyData(request.headers.get('sec-websocket-protocol') || '');
-    const remoteRef = { value: null };
+    const remoteRef = { value: null, writer: null };
     let dnsWriter = null;
+    let relayStarted = false;
+    const pending = [];
 
     makeWSReadable(ws, earlyData).pipeTo(new WritableStream({
         async write(chunk) {
@@ -295,15 +300,17 @@ async function vlessOverWS(request, uuidBytes, proxyIP, proxyPort, dohURL) {
                 dnsWriter.write(chunk);
                 return;
             }
-            if (remoteRef.value) {
-                const writer = remoteRef.value.writable.getWriter();
-                try {
-                    await writer.write(chunk);
-                } finally {
-                    writer.releaseLock();
-                }
+            // H3: persistent writer — no per-chunk getWriter/releaseLock
+            if (remoteRef.writer) {
+                await remoteRef.writer.write(chunk);
                 return;
             }
+            // H1: buffer chunks while TCP connection is in progress
+            if (relayStarted) {
+                pending.push(chunk);
+                return;
+            }
+            relayStarted = true;
 
             const hdr = parseVlessHeader(chunk, uuidBytes);
             if (hdr.error) throw new Error(hdr.error);
@@ -317,8 +324,7 @@ async function vlessOverWS(request, uuidBytes, proxyIP, proxyPort, dohURL) {
                 return;
             }
 
-            relayTCP(hdr.address, hdr.port, payload, ws, respHeader, proxyIP, proxyPort, remoteRef)
-                .catch(err => { console.error('relayTCP failed', err); safeCloseWS(ws); });
+            relayTCP(hdr.address, hdr.port, payload, ws, respHeader, proxyIP, proxyPort, remoteRef, pending);
         },
     })).catch(err => console.error('ws pipe error', err));
 
@@ -401,10 +407,9 @@ function parseVlessHeader(buf, expectedBytes) {
 
 // ── TCP Relay ──────────────────────────────────────────────────────────
 
-async function relayTCP(address, port, initialData, ws, respHeader, proxyIP, proxyPort, remoteRef) {
+async function relayTCP(address, port, initialData, ws, respHeader, proxyIP, proxyPort, remoteRef, pending) {
     async function connectAndWrite(addr, connectPort) {
         const socket = connect({ hostname: addr, port: connectPort || port });
-        remoteRef.value = socket;
 
         let timer;
         const timeout = new Promise((_, rej) => {
@@ -418,55 +423,106 @@ async function relayTCP(address, port, initialData, ws, respHeader, proxyIP, pro
         } finally {
             clearTimeout(timer);
         }
-
-        const writer = socket.writable.getWriter();
-        try {
-            await writer.write(initialData);
-        } finally {
-            writer.releaseLock();
-        }
+        // H6: expose socket only after it's opened; H3: persistent writer
+        remoteRef.value = socket;
+        remoteRef.writer = socket.writable.getWriter();
+        await remoteRef.writer.write(initialData);
         return socket;
     }
 
     async function retry() {
         if (ws.readyState !== WS_OPEN) return;
+        if (remoteRef.writer) {
+            try { remoteRef.writer.releaseLock(); } catch {}
+            remoteRef.writer = null;
+        }
         const old = remoteRef.value;
         remoteRef.value = null;
         if (old) try { old.close(); } catch {}
 
         const pool = getPool();
         if (pool.length === 0) { safeCloseWS(ws); return; }
-        const maxRetries = 4;
+        // H5: reduced from 4 to 2 concurrent retries
+        const maxRetries = 2;
         const tried = new Set();
-        const candidates = proxyIP && proxyIP !== address ? [proxyIP] : [];
+        const candidatesSet = new Set(proxyIP && proxyIP !== address ? [proxyIP] : []);
         for (let i = 0; i < maxRetries && tried.size < pool.length; i++) {
             let idx;
             do { idx = Math.floor(Math.random() * pool.length); } while (tried.has(idx));
             tried.add(idx);
-            candidates.push(pool[idx]);
+            candidatesSet.add(pool[idx]);
         }
+        const candidates = [...candidatesSet];
 
-        for (const addr of candidates) {
-            const [host, portStr] = addr.includes(':') ? addr.split(':') : [addr, null];
-            const p = portStr ? parseInt(portStr) : (proxyPort || port);
+        let won = false;
+        const allSockets = [];
+
+        const attempts = candidates.map(async (addr) => {
+            const [host, p] = parseHostPort(addr, proxyPort || port);
+            const socket = connect({ hostname: host, port: p });
+            allSockets.push(socket);
+
+            let timer;
             try {
-                const socket = await connectAndWrite(host, p);
-                pipeRemoteToWS(socket, ws, respHeader, null);
-                return;
-            } catch { /* try next */ }
+                await Promise.race([
+                    socket.opened,
+                    new Promise((_, r) => { timer = setTimeout(() => r(new Error('timeout')), RETRY_TIMEOUT); }),
+                ]);
+            } catch (e) {
+                try { socket.close(); } catch {}
+                throw e;
+            } finally {
+                clearTimeout(timer);
+            }
+
+            if (won) {
+                try { socket.close(); } catch {}
+                throw new Error('lost');
+            }
+            won = true;
+            // H2: write initial data before exposing socket to WS write handler
+            const writer = socket.writable.getWriter();
+            try {
+                await writer.write(initialData);
+            } finally {
+                writer.releaseLock();
+            }
+
+            remoteRef.value = socket;
+            remoteRef.writer = socket.writable.getWriter();
+            for (const s of allSockets) {
+                if (s && s !== socket) try { s.close(); } catch {}
+            }
+            return socket;
+        });
+
+        try {
+            const socket = await Promise.any(attempts);
+            while (pending.length > 0 && remoteRef.writer) {
+                await remoteRef.writer.write(pending.shift());
+            }
+            pipeRemoteToWS(socket, ws, respHeader, null);
+        } catch {
+            safeCloseWS(ws);
         }
-        safeCloseWS(ws);
     }
 
     try {
         const socket = await connectAndWrite(address);
+        while (pending.length > 0 && remoteRef.writer) {
+            await remoteRef.writer.write(pending.shift());
+        }
         pipeRemoteToWS(socket, ws, respHeader, retry);
     } catch {
+        if (remoteRef.writer) {
+            try { remoteRef.writer.releaseLock(); } catch {}
+            remoteRef.writer = null;
+        }
         if (remoteRef.value) {
             try { remoteRef.value.close(); } catch {}
             remoteRef.value = null;
         }
-        retry().catch(err => console.error('retry failed', err));
+        retry();
     }
 }
 
@@ -479,8 +535,12 @@ async function pipeRemoteToWS(socket, ws, respHeader, retryFn) {
             async write(chunk) {
                 hasData = true;
                 if (ws.readyState !== WS_OPEN) throw new Error('ws closed');
+                // C1: synchronous Uint8Array concat replaces async Blob
                 if (!headerSent) {
-                    ws.send(await new Blob([respHeader, chunk]).arrayBuffer());
+                    const combined = new Uint8Array(respHeader.length + chunk.byteLength);
+                    combined.set(respHeader, 0);
+                    combined.set(new Uint8Array(chunk), respHeader.length);
+                    ws.send(combined.buffer);
                     headerSent = true;
                 } else {
                     ws.send(chunk);
@@ -489,11 +549,18 @@ async function pipeRemoteToWS(socket, ws, respHeader, retryFn) {
         }));
     } catch (err) {
         console.error('pipeRemoteToWS error', err);
+        try { socket.close(); } catch {}
+        if (!hasData && retryFn && ws.readyState === WS_OPEN) {
+            retryFn();
+            return;
+        }
         safeCloseWS(ws);
+        return;
     }
 
+    try { socket.close(); } catch {}
     if (!hasData && retryFn && ws.readyState === WS_OPEN) {
-        retryFn().catch(err => console.error('retryFn failed', err));
+        retryFn();
     }
 }
 
@@ -540,7 +607,9 @@ async function handleDNS(ws, respHeader, initialChunk, dohURL) {
 
     async function resolve(data) {
         if (pending >= MAX_PENDING_DNS) {
-            console.warn(`DNS query dropped: ${pending} pending (limit ${MAX_PENDING_DNS})`);
+            // H4: close WS instead of silent drop — client can detect failure
+            console.warn(`DNS limit reached (${MAX_PENDING_DNS}), closing`);
+            safeCloseWS(ws);
             return;
         }
         pending++;
@@ -555,11 +624,19 @@ async function handleDNS(ws, respHeader, initialChunk, dohURL) {
             const sizeHdr = new Uint8Array([(result.length >> 8) & 0xff, result.length & 0xff]);
 
             if (ws.readyState !== WS_OPEN) return;
+            // C1: synchronous Uint8Array concat replaces async Blob
             if (!headerSent) {
-                ws.send(await new Blob([respHeader, sizeHdr, result]).arrayBuffer());
+                const combined = new Uint8Array(respHeader.length + 2 + result.length);
+                combined.set(respHeader, 0);
+                combined.set(sizeHdr, respHeader.length);
+                combined.set(result, respHeader.length + 2);
+                ws.send(combined.buffer);
                 headerSent = true;
             } else {
-                ws.send(await new Blob([sizeHdr, result]).arrayBuffer());
+                const combined = new Uint8Array(2 + result.length);
+                combined.set(sizeHdr, 0);
+                combined.set(result, 2);
+                ws.send(combined.buffer);
             }
         } catch (err) {
             console.error('DNS resolve error', err);
@@ -632,4 +709,23 @@ function safeCloseWS(ws) {
     try {
         if (ws.readyState === WS_OPEN || ws.readyState === 2) ws.close();
     } catch { /* ignore */ }
+}
+
+function parseHostPort(addr, defaultPort) {
+    if (addr.startsWith('[')) {
+        const close = addr.indexOf(']');
+        if (close === -1) return [addr, defaultPort];
+        const host = addr.substring(1, close);
+        const rest = addr.substring(close + 1);
+        return rest.startsWith(':') ? [host, parseInt(rest.substring(1)) || defaultPort] : [host, defaultPort];
+    }
+    const lastColon = addr.lastIndexOf(':');
+    if (lastColon === -1) return [addr, defaultPort];
+    if (addr.indexOf(':') === lastColon) {
+        const port = parseInt(addr.substring(lastColon + 1));
+        return Number.isFinite(port) && port > 0 && port <= 65535
+            ? [addr.substring(0, lastColon), port]
+            : [addr, defaultPort];
+    }
+    return [addr, defaultPort];
 }
