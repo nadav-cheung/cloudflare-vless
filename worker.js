@@ -265,7 +265,7 @@ export default {
         }
 
         if (url.pathname === `/sub/${uuid}`) {
-            return new Response(btoa(generateSub(uuid, url.hostname, proxyIP)), {
+            return new Response(btoa(generateSub(uuid, url.hostname)), {
                 headers: { 'Content-Type': 'text/plain; charset=utf-8' },
             });
         }
@@ -584,13 +584,11 @@ async function handleDNS(ws, respHeader, initialChunk, dohURL) {
 
 // ── Subscription Generator ─────────────────────────────────────────────
 
-function generateSub(uuid, host, proxyIP) {
-    const proxyHost = proxyIP && proxyIP.includes(':') ? proxyIP.split(':')[0] : proxyIP;
+function generateSub(uuid, host) {
     const base = `?encryption=none&security=tls&sni=${host}&fp=random&type=ws&host=${host}&path=%2F%3Fed%3D2048`;
     const lines = [];
     for (const port of HTTPS_PORTS) {
         lines.push(`vless://${uuid}@${host}:${port}${base}#${host}-${port}`);
-        lines.push(`vless://${uuid}@${proxyHost}:${port}${base}#${host}-${proxyHost}-${port}`);
     }
     return lines.join('\n');
 }
