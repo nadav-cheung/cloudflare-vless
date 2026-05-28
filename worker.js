@@ -20,8 +20,8 @@ const SOURCE_TIERS = [
 const PROXYIP_DOH_DOMAINS = [
     'proxyip.cmliussss.net',
 ];
-const POOL_MIN = 5;
-const POOL_MAX = 20;
+const POOL_MIN = 10;
+const POOL_MAX = 50;
 const PROBE_CONCURRENCY = 6;
 const PROBE_TIMEOUT_MS = 100;
 const DEFAULT_DOH = 'https://cloudflare-dns.com/dns-query';
@@ -203,16 +203,14 @@ async function probeOne(addr) {
     if (!Number.isFinite(port) || port < 1 || port > 65535) {
         throw new Error(`invalid port: ${addr}`);
     }
-    const start = Date.now();
     const sock = connect({ hostname: host, port });
     try {
         await Promise.race([
             sock.opened,
             new Promise((_, r) => setTimeout(() => r(new Error('timeout')), PROBE_TIMEOUT_MS)),
         ]);
-        console.log(`[probe] ${addr} OK ${Date.now() - start}ms`);
     } catch (e) {
-        console.log(`[probe] ${addr} FAIL ${Date.now() - start}ms ${e.message}`);
+        console.log(`[probe] ${addr} FAIL ${e.message}`);
         throw e;
     } finally {
         sock.close();
