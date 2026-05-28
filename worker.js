@@ -58,6 +58,7 @@ function addToPool(ips) {
 }
 
 async function healthCheck() {
+    if (_refilling) await _refilling;
     if (_pool.length === 0) return;
     const before = [..._pool];
     const start = Date.now();
@@ -165,44 +166,33 @@ function isPublicIP(ip) {
 }
 
 async function fetchSourceURL(url) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 5000);
-    try {
-        const resp = await fetch(url, { signal: controller.signal });
-        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-        const text = await resp.text();
-        const ips = text.trim().split('\n')
-            .map(s => s.trim())
-            .filter(s => s && !s.startsWith('#') && isPublicIP(s));
-        if (ips.length === 0) throw new Error('empty');
-        const parsed = new URL(url);
-        const tag = parsed.search || parsed.pathname.split('/').pop() || parsed.hostname;
-        console.log(`[ipdb] ${tag}: ${ips.length} IPs`);
-        return ips;
-    } finally {
-        clearTimeout(timer);
-    }
+    const resp = await fetchWithTimeout(url, {}, 5000);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const text = await resp.text();
+    const ips = text.trim().split('\n')
+        .map(s => s.trim())
+        .filter(s => s && !s.startsWith('#') && isPublicIP(s));
+    if (ips.length === 0) throw new Error('empty');
+    const parsed = new URL(url);
+    const tag = parsed.search || parsed.pathname.split('/').pop() || parsed.hostname;
+    console.log(`[ipdb] ${tag}: ${ips.length} IPs`);
+    return ips;
 }
 
 async function resolveDoH() {
     const all = [];
     const results = await Promise.allSettled(PROXYIP_DOH_DOMAINS.map(async (domain) => {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 5000);
-        try {
-            const resp = await fetch(`https://cloudflare-dns.com/dns-query?name=${domain}&type=A`, {
-                headers: { accept: 'application/dns-json' },
-                signal: controller.signal,
-            });
-            if (!resp.ok) throw new Error(`DoH ${domain}: HTTP ${resp.status}`);
-            const data = await resp.json();
-            const ips = (data.Answer || []).filter(a => a.type === 1).map(a => a.data);
-            if (ips.length === 0) throw new Error(`DoH ${domain}: no IPs`);
-            console.log(`[doh] ${domain}: ${ips.length} IPs`);
-            return ips;
-        } finally {
-            clearTimeout(timer);
-        }
+        const resp = await fetchWithTimeout(
+            `https://cloudflare-dns.com/dns-query?name=${domain}&type=A`,
+            { headers: { accept: 'application/dns-json' } },
+            5000,
+        );
+        if (!resp.ok) throw new Error(`DoH ${domain}: HTTP ${resp.status}`);
+        const data = await resp.json();
+        const ips = (data.Answer || []).filter(a => a.type === 1).map(a => a.data);
+        if (ips.length === 0) throw new Error(`DoH ${domain}: no IPs`);
+        console.log(`[doh] ${domain}: ${ips.length} IPs`);
+        return ips;
     }));
     for (const r of results) {
         if (r.status === 'fulfilled' && r.value) all.push(...r.value);
@@ -269,15 +259,19 @@ export default {
 
         const configProxyIP = env.PROXYIP || null;
         if (!configProxyIP && _pool.length === 0 && !_refilling && (Date.now() - _lastRefillFail) > REFILL_RETRY_INTERVAL_MS) {
-            ctx.waitUntil(
-                quickRefill()
-                    .catch(e => console.error('[pool] quick-refill:', e.message))
-                    .then(() => { if (_pool.length === 0) _lastRefillFail = Date.now(); })
-            );
+            try {
+                await Promise.race([
+                    quickRefill(),
+                    new Promise(resolve => setTimeout(resolve, 5_000)),
+                ]);
+            } catch (e) {
+                console.error('[pool] quick-refill:', e.message);
+            }
+            if (_pool.length === 0) _lastRefillFail = Date.now();
         }
         const pool = configProxyIP ? [] : getPool();
         const proxyIP = configProxyIP || pool[Math.floor(Math.random() * pool.length)];
-        const proxyPort = env.PROXYPORT || null;
+        const proxyPort = parseInt(env.PROXYPORT) || null;
         return vlessOverWS(request, uuidBytes, proxyIP, proxyPort, dohURL);
     },
 
@@ -453,8 +447,7 @@ async function relayTCP(address, port, initialData, ws, respHeader, proxyIP, pro
 
         const pool = getPool();
         if (pool.length === 0) { safeCloseWS(ws); return; }
-        // Limit concurrent retries to bound socket creation at scale
-        const maxRetries = 2;
+        const maxRetries = 3;
         const tried = new Set();
         const candidatesSet = new Set(proxyIP && proxyIP !== address ? [proxyIP] : []);
         for (let i = 0; i < maxRetries && tried.size < pool.length; i++) {
@@ -470,6 +463,7 @@ async function relayTCP(address, port, initialData, ws, respHeader, proxyIP, pro
 
         const attempts = candidates.map(async (addr) => {
             const [host, p] = parseHostPort(addr, proxyPort || port);
+            if (!Number.isFinite(p) || p < 1 || p > 65535) throw new Error(`invalid port: ${addr}`);
             const socket = connect({ hostname: host, port: p });
             allSockets.push(socket);
 
@@ -494,16 +488,17 @@ async function relayTCP(address, port, initialData, ws, respHeader, proxyIP, pro
             const writer = socket.writable.getWriter();
             try {
                 await writer.write(initialData);
-                // Drain buffered chunks before yielding — preserves TCP byte ordering
-                while (pending.length > 0) {
-                    await writer.write(pending.shift());
-                }
+                const toDrain = pending.splice(0);
+                for (const chunk of toDrain) await writer.write(chunk);
             } finally {
                 writer.releaseLock();
             }
 
             remoteRef.value = socket;
             remoteRef.writer = socket.writable.getWriter();
+            // Drain chunks that arrived during the transition
+            const late = pending.splice(0);
+            for (const chunk of late) await remoteRef.writer.write(chunk);
             for (const s of allSockets) {
                 if (s && s !== socket) try { s.close(); } catch {}
             }
@@ -512,9 +507,6 @@ async function relayTCP(address, port, initialData, ws, respHeader, proxyIP, pro
 
         try {
             const socket = await Promise.any(attempts);
-            while (pending.length > 0 && remoteRef.writer) {
-                await remoteRef.writer.write(pending.shift());
-            }
             pipeRemoteToWS(socket, ws, respHeader, null);
         } catch {
             for (const s of allSockets) try { s.close(); } catch {}
@@ -524,11 +516,12 @@ async function relayTCP(address, port, initialData, ws, respHeader, proxyIP, pro
 
     try {
         const { socket, writer } = await connectAndWrite(address);
-        // Drain buffered chunks before exposing writer — preserves TCP byte ordering
-        while (pending.length > 0) {
-            await writer.write(pending.shift());
-        }
+        const toDrain = pending.splice(0);
+        for (const chunk of toDrain) await writer.write(chunk);
         remoteRef.writer = writer;
+        // Drain chunks that arrived during the transition
+        const late = pending.splice(0);
+        for (const chunk of late) await remoteRef.writer.write(chunk);
         pipeRemoteToWS(socket, ws, respHeader, retry);
     } catch {
         if (remoteRef.writer) {
@@ -552,12 +545,8 @@ async function pipeRemoteToWS(socket, ws, respHeader, retryFn) {
             async write(chunk) {
                 hasData = true;
                 if (ws.readyState !== WS_OPEN) throw new Error('ws closed');
-                // Uint8Array concat avoids async Blob overhead on the hot path
                 if (!headerSent) {
-                    const combined = new Uint8Array(respHeader.length + chunk.byteLength);
-                    combined.set(respHeader, 0);
-                    combined.set(new Uint8Array(chunk), respHeader.length);
-                    ws.send(combined.buffer);
+                    ws.send(concatBytes(respHeader, chunk).buffer);
                     headerSent = true;
                 } else {
                     ws.send(chunk);
@@ -567,20 +556,12 @@ async function pipeRemoteToWS(socket, ws, respHeader, retryFn) {
     } catch (err) {
         console.error('pipeRemoteToWS error', err);
         try { socket.close(); } catch {}
-        if (!hasData && retryFn && ws.readyState === WS_OPEN) {
-            retryFn();
-            return;
-        }
-        safeCloseWS(ws);
-        return;
     }
 
-    try { socket.close(); } catch {}
-    if (!hasData && retryFn && ws.readyState === WS_OPEN) {
-        retryFn();
-    } else if (!hasData && ws.readyState === WS_OPEN) {
-        // No retry available — close WS so client detects failure instead of hanging
-        safeCloseWS(ws);
+    if (!hasData && ws.readyState === WS_OPEN) {
+        retryFn ? retryFn() : safeCloseWS(ws);
+    } else {
+        try { socket.close(); } catch {}
     }
 }
 
@@ -602,9 +583,7 @@ async function handleDNS(ws, respHeader, initialChunk, dohURL) {
             safeCloseWS(ws);
             throw new Error('DNS buffer overflow');
         }
-        const merged = new Uint8Array(buffer.length + data.length);
-        merged.set(buffer, 0);
-        merged.set(data, buffer.length);
+        const merged = concatBytes(buffer, data);
         buffer = merged;
     }
 
@@ -627,44 +606,30 @@ async function handleDNS(ws, respHeader, initialChunk, dohURL) {
 
     async function resolve(data) {
         if (pending >= MAX_PENDING_DNS) {
-            // Close WS so client detects failure instead of silent drop
-            console.warn(`DNS limit reached (${MAX_PENDING_DNS}), closing`);
-            safeCloseWS(ws);
+            console.warn(`DNS query dropped: ${pending} pending (limit ${MAX_PENDING_DNS})`);
             return;
         }
         pending++;
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 10_000);
         try {
-            const resp = await fetch(dohURL, {
+            const resp = await fetchWithTimeout(dohURL, {
                 method: 'POST',
                 headers: { 'content-type': 'application/dns-message' },
                 body: data,
-                signal: controller.signal,
-            });
+            }, 10_000);
             if (!resp.ok) throw new Error(`DoH returned ${resp.status}`);
             const result = new Uint8Array(await resp.arrayBuffer());
             const sizeHdr = new Uint8Array([(result.length >> 8) & 0xff, result.length & 0xff]);
 
             if (ws.readyState !== WS_OPEN) return;
-            // Uint8Array concat avoids async Blob overhead on the hot path
             if (!headerSent) {
-                const combined = new Uint8Array(respHeader.length + 2 + result.length);
-                combined.set(respHeader, 0);
-                combined.set(sizeHdr, respHeader.length);
-                combined.set(result, respHeader.length + 2);
-                ws.send(combined.buffer);
+                ws.send(concatBytes(respHeader, sizeHdr, result).buffer);
                 headerSent = true;
             } else {
-                const combined = new Uint8Array(2 + result.length);
-                combined.set(sizeHdr, 0);
-                combined.set(result, 2);
-                ws.send(combined.buffer);
+                ws.send(concatBytes(sizeHdr, result).buffer);
             }
         } catch (err) {
             console.error('DNS resolve error', err);
         } finally {
-            clearTimeout(timer);
             pending--;
         }
     }
@@ -733,6 +698,27 @@ function safeCloseWS(ws) {
     try {
         if (ws.readyState === WS_OPEN || ws.readyState === WS_CLOSING) ws.close();
     } catch { /* ignore */ }
+}
+
+function concatBytes(...parts) {
+    const len = parts.reduce((n, p) => n + p.byteLength, 0);
+    const out = new Uint8Array(len);
+    let off = 0;
+    for (const p of parts) {
+        out.set(p instanceof Uint8Array ? p : new Uint8Array(p), off);
+        off += p.byteLength;
+    }
+    return out;
+}
+
+async function fetchWithTimeout(url, opts = {}, ms = 5000) {
+    const ac = new AbortController();
+    const t = setTimeout(() => ac.abort(), ms);
+    try {
+        return await fetch(url, { ...opts, signal: ac.signal });
+    } finally {
+        clearTimeout(t);
+    }
 }
 
 function parseHostPort(addr, defaultPort) {
