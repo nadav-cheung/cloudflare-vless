@@ -20,10 +20,10 @@ const SOURCE_TIERS = [
 const PROXYIP_DOH_DOMAINS = [
     'proxyip.cmliussss.net',
 ];
-const POOL_MIN = 20;
-const POOL_MAX = 200;
+const POOL_MIN = 5;
+const POOL_MAX = 20;
 const PROBE_CONCURRENCY = 6;
-const PROBE_TIMEOUT_MS = 80;
+const PROBE_TIMEOUT_MS = 100;
 const DEFAULT_DOH = 'https://cloudflare-dns.com/dns-query';
 const HTTPS_PORTS = [443, 8443, 2053, 2096, 2087, 2083];
 const TCP_TIMEOUT = 10_000;

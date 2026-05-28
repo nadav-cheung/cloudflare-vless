@@ -27,3 +27,6 @@ invocation_logs = true
 enabled = true
 persist = true
 head_sampling_rate = 1
+
+[placement]
+host = "fnnas.nadav.com.cn:5666"
