@@ -186,15 +186,22 @@ async function fetchSourceURL(url) {
 async function resolveDoH() {
     const all = [];
     const results = await Promise.allSettled(PROXYIP_DOH_DOMAINS.map(async (domain) => {
-        const resp = await fetch(`https://cloudflare-dns.com/dns-query?name=${domain}&type=A`, {
-            headers: { accept: 'application/dns-json' },
-        });
-        if (!resp.ok) throw new Error(`DoH ${domain}: HTTP ${resp.status}`);
-        const data = await resp.json();
-        const ips = (data.Answer || []).filter(a => a.type === 1).map(a => a.data);
-        if (ips.length === 0) throw new Error(`DoH ${domain}: no IPs`);
-        console.log(`[doh] ${domain}: ${ips.length} IPs`);
-        return ips;
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 5000);
+        try {
+            const resp = await fetch(`https://cloudflare-dns.com/dns-query?name=${domain}&type=A`, {
+                headers: { accept: 'application/dns-json' },
+                signal: controller.signal,
+            });
+            if (!resp.ok) throw new Error(`DoH ${domain}: HTTP ${resp.status}`);
+            const data = await resp.json();
+            const ips = (data.Answer || []).filter(a => a.type === 1).map(a => a.data);
+            if (ips.length === 0) throw new Error(`DoH ${domain}: no IPs`);
+            console.log(`[doh] ${domain}: ${ips.length} IPs`);
+            return ips;
+        } finally {
+            clearTimeout(timer);
+        }
     }));
     for (const r of results) {
         if (r.status === 'fulfilled' && r.value) all.push(...r.value);
@@ -345,7 +352,9 @@ async function vlessOverWS(request, uuidBytes, proxyIP, proxyPort, dohURL) {
 
 function parseVlessHeader(buf, expectedBytes) {
     const v = new Uint8Array(buf);
-    if (v.length < 26) return { error: 'Header too short' };
+    // M3: minimum header is 22 bytes (version+uuid+addonsLen+command+port+addrType),
+    // per-field checks below handle all truncation cases for the address payload
+    if (v.length < 22) return { error: 'Header too short' };
 
     const version = v[0];
     if (version !== 0x00) return { error: `Unsupported version: ${version}` };
@@ -418,16 +427,17 @@ async function relayTCP(address, port, initialData, ws, respHeader, proxyIP, pro
         try {
             await Promise.race([socket.opened, timeout]);
         } catch (err) {
-            socket.close();
+            // M2: don't mask original error with close() exception
+            try { socket.close(); } catch {}
             throw err;
         } finally {
             clearTimeout(timer);
         }
-        // H6: expose socket only after it's opened; H3: persistent writer
+        // C1: return writer to caller — caller drains pending before exposing to WS handler
         remoteRef.value = socket;
-        remoteRef.writer = socket.writable.getWriter();
-        await remoteRef.writer.write(initialData);
-        return socket;
+        const writer = socket.writable.getWriter();
+        await writer.write(initialData);
+        return { socket, writer };
     }
 
     async function retry() {
@@ -480,10 +490,13 @@ async function relayTCP(address, port, initialData, ws, respHeader, proxyIP, pro
                 throw new Error('lost');
             }
             won = true;
-            // H2: write initial data before exposing socket to WS write handler
             const writer = socket.writable.getWriter();
             try {
                 await writer.write(initialData);
+                // C1: drain pending before next await yields control — preserves byte order
+                while (pending.length > 0) {
+                    await writer.write(pending.shift());
+                }
             } finally {
                 writer.releaseLock();
             }
@@ -503,15 +516,18 @@ async function relayTCP(address, port, initialData, ws, respHeader, proxyIP, pro
             }
             pipeRemoteToWS(socket, ws, respHeader, null);
         } catch {
+            for (const s of allSockets) try { s.close(); } catch {}
             safeCloseWS(ws);
         }
     }
 
     try {
-        const socket = await connectAndWrite(address);
-        while (pending.length > 0 && remoteRef.writer) {
-            await remoteRef.writer.write(pending.shift());
+        const { socket, writer } = await connectAndWrite(address);
+        // C1: drain pending BEFORE exposing writer — preserves TCP byte order
+        while (pending.length > 0) {
+            await writer.write(pending.shift());
         }
+        remoteRef.writer = writer;
         pipeRemoteToWS(socket, ws, respHeader, retry);
     } catch {
         if (remoteRef.writer) {
@@ -561,6 +577,9 @@ async function pipeRemoteToWS(socket, ws, respHeader, retryFn) {
     try { socket.close(); } catch {}
     if (!hasData && retryFn && ws.readyState === WS_OPEN) {
         retryFn();
+    } else if (!hasData && ws.readyState === WS_OPEN) {
+        // M1: no retry available — close WS so client can detect failure
+        safeCloseWS(ws);
     }
 }
 
@@ -613,11 +632,14 @@ async function handleDNS(ws, respHeader, initialChunk, dohURL) {
             return;
         }
         pending++;
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 10_000);
         try {
             const resp = await fetch(dohURL, {
                 method: 'POST',
                 headers: { 'content-type': 'application/dns-message' },
                 body: data,
+                signal: controller.signal,
             });
             if (!resp.ok) throw new Error(`DoH returned ${resp.status}`);
             const result = new Uint8Array(await resp.arrayBuffer());
@@ -641,6 +663,7 @@ async function handleDNS(ws, respHeader, initialChunk, dohURL) {
         } catch (err) {
             console.error('DNS resolve error', err);
         } finally {
+            clearTimeout(timer);
             pending--;
         }
     }
