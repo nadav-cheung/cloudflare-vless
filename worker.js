@@ -29,6 +29,7 @@ const HTTPS_PORTS = [443, 8443, 2053, 2096, 2087, 2083];
 const TCP_TIMEOUT = 10_000;
 const RETRY_TIMEOUT = 5_000;
 const WS_OPEN = 1;
+const WS_CLOSING = 2;
 
 let _pool = [];
 let _refilling = null;
@@ -48,7 +49,7 @@ function getPool() {
 
 function addToPool(ips) {
     const existing = new Set(_pool);
-    const unique = ips.filter(ip => !existing.has(ip));
+    const unique = [...new Set(ips.filter(ip => !existing.has(ip)))];
     const room = Math.max(0, POOL_MAX - _pool.length);
     const toAdd = unique.slice(0, room);
     _pool.push(...toAdd);
@@ -307,12 +308,12 @@ async function vlessOverWS(request, uuidBytes, proxyIP, proxyPort, dohURL) {
                 dnsWriter.write(chunk);
                 return;
             }
-            // H3: persistent writer — no per-chunk getWriter/releaseLock
+            // Reuse a single writer for all WS→socket writes, acquired once per connection
             if (remoteRef.writer) {
                 await remoteRef.writer.write(chunk);
                 return;
             }
-            // H1: buffer chunks while TCP connection is in progress
+            // Buffer chunks arriving during TCP handshake, drained once connected
             if (relayStarted) {
                 pending.push(chunk);
                 return;
@@ -352,8 +353,8 @@ async function vlessOverWS(request, uuidBytes, proxyIP, proxyPort, dohURL) {
 
 function parseVlessHeader(buf, expectedBytes) {
     const v = new Uint8Array(buf);
-    // M3: minimum header is 22 bytes (version+uuid+addonsLen+command+port+addrType),
-    // per-field checks below handle all truncation cases for the address payload
+    // Floor: version(1)+uuid(16)+addonsLen(1)+command(1)+port(2)+addrType(1)=22;
+    // per-field truncation checks below validate the address payload bounds
     if (v.length < 22) return { error: 'Header too short' };
 
     const version = v[0];
@@ -427,13 +428,13 @@ async function relayTCP(address, port, initialData, ws, respHeader, proxyIP, pro
         try {
             await Promise.race([socket.opened, timeout]);
         } catch (err) {
-            // M2: don't mask original error with close() exception
+            // Don't let socket.close() throw mask the connection error
             try { socket.close(); } catch {}
             throw err;
         } finally {
             clearTimeout(timer);
         }
-        // C1: return writer to caller — caller drains pending before exposing to WS handler
+        // Return writer to caller — caller drains pending before exposing to WS handler
         remoteRef.value = socket;
         const writer = socket.writable.getWriter();
         await writer.write(initialData);
@@ -452,7 +453,7 @@ async function relayTCP(address, port, initialData, ws, respHeader, proxyIP, pro
 
         const pool = getPool();
         if (pool.length === 0) { safeCloseWS(ws); return; }
-        // H5: reduced from 4 to 2 concurrent retries
+        // Limit concurrent retries to bound socket creation at scale
         const maxRetries = 2;
         const tried = new Set();
         const candidatesSet = new Set(proxyIP && proxyIP !== address ? [proxyIP] : []);
@@ -493,7 +494,7 @@ async function relayTCP(address, port, initialData, ws, respHeader, proxyIP, pro
             const writer = socket.writable.getWriter();
             try {
                 await writer.write(initialData);
-                // C1: drain pending before next await yields control — preserves byte order
+                // Drain buffered chunks before yielding — preserves TCP byte ordering
                 while (pending.length > 0) {
                     await writer.write(pending.shift());
                 }
@@ -523,7 +524,7 @@ async function relayTCP(address, port, initialData, ws, respHeader, proxyIP, pro
 
     try {
         const { socket, writer } = await connectAndWrite(address);
-        // C1: drain pending BEFORE exposing writer — preserves TCP byte order
+        // Drain buffered chunks before exposing writer — preserves TCP byte ordering
         while (pending.length > 0) {
             await writer.write(pending.shift());
         }
@@ -551,7 +552,7 @@ async function pipeRemoteToWS(socket, ws, respHeader, retryFn) {
             async write(chunk) {
                 hasData = true;
                 if (ws.readyState !== WS_OPEN) throw new Error('ws closed');
-                // C1: synchronous Uint8Array concat replaces async Blob
+                // Uint8Array concat avoids async Blob overhead on the hot path
                 if (!headerSent) {
                     const combined = new Uint8Array(respHeader.length + chunk.byteLength);
                     combined.set(respHeader, 0);
@@ -578,7 +579,7 @@ async function pipeRemoteToWS(socket, ws, respHeader, retryFn) {
     if (!hasData && retryFn && ws.readyState === WS_OPEN) {
         retryFn();
     } else if (!hasData && ws.readyState === WS_OPEN) {
-        // M1: no retry available — close WS so client can detect failure
+        // No retry available — close WS so client detects failure instead of hanging
         safeCloseWS(ws);
     }
 }
@@ -626,7 +627,7 @@ async function handleDNS(ws, respHeader, initialChunk, dohURL) {
 
     async function resolve(data) {
         if (pending >= MAX_PENDING_DNS) {
-            // H4: close WS instead of silent drop — client can detect failure
+            // Close WS so client detects failure instead of silent drop
             console.warn(`DNS limit reached (${MAX_PENDING_DNS}), closing`);
             safeCloseWS(ws);
             return;
@@ -646,7 +647,7 @@ async function handleDNS(ws, respHeader, initialChunk, dohURL) {
             const sizeHdr = new Uint8Array([(result.length >> 8) & 0xff, result.length & 0xff]);
 
             if (ws.readyState !== WS_OPEN) return;
-            // C1: synchronous Uint8Array concat replaces async Blob
+            // Uint8Array concat avoids async Blob overhead on the hot path
             if (!headerSent) {
                 const combined = new Uint8Array(respHeader.length + 2 + result.length);
                 combined.set(respHeader, 0);
@@ -730,7 +731,7 @@ function isValidUUID(uuid) {
 
 function safeCloseWS(ws) {
     try {
-        if (ws.readyState === WS_OPEN || ws.readyState === 2) ws.close();
+        if (ws.readyState === WS_OPEN || ws.readyState === WS_CLOSING) ws.close();
     } catch { /* ignore */ }
 }
 
