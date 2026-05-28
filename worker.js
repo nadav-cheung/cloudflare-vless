@@ -48,13 +48,16 @@ function getPool() {
 }
 
 function addToPool(ips) {
-    const existing = new Set(_pool);
-    const unique = [...new Set(ips.filter(ip => !existing.has(ip)))];
-    const room = Math.max(0, POOL_MAX - _pool.length);
-    const toAdd = unique.slice(0, room);
-    _pool.push(...toAdd);
-    if (_pool.length > POOL_MAX) _pool.length = POOL_MAX;
-    return toAdd.length;
+    const seen = new Set(_pool);
+    const room = POOL_MAX - _pool.length;
+    let added = 0;
+    for (const ip of ips) {
+        if (added >= room || seen.has(ip)) continue;
+        seen.add(ip);
+        _pool.push(ip);
+        added++;
+    }
+    return added;
 }
 
 async function healthCheck() {
@@ -328,7 +331,7 @@ async function vlessOverWS(request, uuidBytes, proxyIP, proxyPort, dohURL) {
 
             relayTCP(hdr.address, hdr.port, payload, ws, respHeader, proxyIP, proxyPort, remoteRef, pending);
         },
-    })).catch(err => console.error('ws pipe error', err));
+    })).catch(err => { console.error('ws pipe error', err); safeCloseWS(ws); });
 
     return new Response(null, { status: 101, webSocket: client });
 }
@@ -387,7 +390,7 @@ function parseVlessHeader(buf, expectedBytes) {
             if (base >= v.length) return { error: 'Truncated domain length' };
             const dLen = v[base];
             if (base + 1 + dLen > v.length) return { error: 'Truncated domain' };
-            address = new TextDecoder().decode(buf.slice(base + 1, base + 1 + dLen));
+            address = _td.decode(v.subarray(base + 1, base + 1 + dLen));
             rawDataIndex = base + 1 + dLen;
             break;
         }
@@ -507,7 +510,7 @@ async function relayTCP(address, port, initialData, ws, respHeader, proxyIP, pro
 
         try {
             const socket = await Promise.any(attempts);
-            pipeRemoteToWS(socket, ws, respHeader, null);
+            pipeRemoteToWS(socket, ws, respHeader, remoteRef, null);
         } catch {
             for (const s of allSockets) try { s.close(); } catch {}
             safeCloseWS(ws);
@@ -522,7 +525,7 @@ async function relayTCP(address, port, initialData, ws, respHeader, proxyIP, pro
         // Drain chunks that arrived during the transition
         const late = pending.splice(0);
         for (const chunk of late) await remoteRef.writer.write(chunk);
-        pipeRemoteToWS(socket, ws, respHeader, retry);
+        pipeRemoteToWS(socket, ws, respHeader, remoteRef, retry);
     } catch {
         if (remoteRef.writer) {
             try { remoteRef.writer.releaseLock(); } catch {}
@@ -532,36 +535,37 @@ async function relayTCP(address, port, initialData, ws, respHeader, proxyIP, pro
             try { remoteRef.value.close(); } catch {}
             remoteRef.value = null;
         }
-        retry();
+        retry().catch(() => {});
     }
 }
 
-async function pipeRemoteToWS(socket, ws, respHeader, retryFn) {
+async function pipeRemoteToWS(socket, ws, respHeader, remoteRef, retryFn) {
     let headerSent = false;
     let hasData = false;
 
     try {
         await socket.readable.pipeTo(new WritableStream({
-            async write(chunk) {
+            write(chunk) {
                 hasData = true;
                 if (ws.readyState !== WS_OPEN) throw new Error('ws closed');
-                if (!headerSent) {
-                    ws.send(concatBytes(respHeader, chunk).buffer);
-                    headerSent = true;
-                } else {
-                    ws.send(chunk);
-                }
+                ws.send(headerSent ? chunk : concatBytes(respHeader, chunk));
+                headerSent = true;
             },
         }));
     } catch (err) {
-        console.error('pipeRemoteToWS error', err);
+        if (hasData || ws.readyState !== WS_OPEN) console.error('pipeRemoteToWS error', err);
+    } finally {
         try { socket.close(); } catch {}
     }
 
-    if (!hasData && ws.readyState === WS_OPEN) {
-        retryFn ? retryFn() : safeCloseWS(ws);
+    if (!hasData && ws.readyState === WS_OPEN && retryFn) {
+        if (remoteRef.writer) {
+            try { remoteRef.writer.releaseLock(); } catch {}
+            remoteRef.writer = null;
+        }
+        retryFn().catch(() => {});
     } else {
-        try { socket.close(); } catch {}
+        safeCloseWS(ws);
     }
 }
 
@@ -575,32 +579,37 @@ const MAX_PENDING_DNS = 16;
 
 async function handleDNS(ws, respHeader, initialChunk, dohURL) {
     let headerSent = false;
-    let buffer = new Uint8Array(0);
+    const buf = new Uint8Array(MAX_DNS_BUFFER);
+    let bufLen = 0;
     let pending = 0;
 
     function append(data) {
-        if (buffer.length + data.length > MAX_DNS_BUFFER) {
+        const d = data instanceof Uint8Array ? data : new Uint8Array(data);
+        if (bufLen + d.length > MAX_DNS_BUFFER) {
             safeCloseWS(ws);
             throw new Error('DNS buffer overflow');
         }
-        const merged = concatBytes(buffer, data);
-        buffer = merged;
+        buf.set(d, bufLen);
+        bufLen += d.length;
     }
 
     function extractPackets() {
         const packets = [];
         let off = 0;
-        while (off + 2 <= buffer.length) {
-            const len = (buffer[off] << 8) | buffer[off + 1];
+        while (off + 2 <= bufLen) {
+            const len = (buf[off] << 8) | buf[off + 1];
             if (len === 0 || len > MAX_DNS_PACKET) {
                 off += 2;
                 continue;
             }
-            if (off + 2 + len > buffer.length) break;
-            packets.push(buffer.slice(off + 2, off + 2 + len));
+            if (off + 2 + len > bufLen) break;
+            packets.push(buf.slice(off + 2, off + 2 + len));
             off += 2 + len;
         }
-        if (off > 0) buffer = buffer.slice(off);
+        if (off > 0) {
+            buf.copyWithin(0, off, bufLen);
+            bufLen -= off;
+        }
         return packets;
     }
 
@@ -622,10 +631,10 @@ async function handleDNS(ws, respHeader, initialChunk, dohURL) {
 
             if (ws.readyState !== WS_OPEN) return;
             if (!headerSent) {
-                ws.send(concatBytes(respHeader, sizeHdr, result).buffer);
+                ws.send(concatBytes(respHeader, sizeHdr, result));
                 headerSent = true;
             } else {
-                ws.send(concatBytes(sizeHdr, result).buffer);
+                ws.send(concatBytes(sizeHdr, result));
             }
         } catch (err) {
             console.error('DNS resolve error', err);
@@ -657,6 +666,8 @@ function generateSub(uuid, host) {
 }
 
 // ── Utilities ──────────────────────────────────────────────────────────
+
+const _td = new TextDecoder();
 
 function makeWSReadable(ws, earlyData) {
     return new ReadableStream({
@@ -701,8 +712,9 @@ function safeCloseWS(ws) {
 }
 
 function concatBytes(...parts) {
-    const len = parts.reduce((n, p) => n + p.byteLength, 0);
-    const out = new Uint8Array(len);
+    let total = 0;
+    for (const p of parts) total += p.byteLength;
+    const out = new Uint8Array(total);
     let off = 0;
     for (const p of parts) {
         out.set(p instanceof Uint8Array ? p : new Uint8Array(p), off);
